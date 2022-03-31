@@ -48,12 +48,14 @@ import csv
 import hashlib
 import itertools
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Dict, List
 from fontTools import ttLib
 from fontTools.ttLib.tables import otTables
 from nototools import font_data
@@ -144,8 +146,8 @@ def codepoint_to_string(codepoints):
 def prepend_header_to_file(file_path, header_path):
     """Prepends the header to the file. Used to update flatbuffer java files with header, comments
     and annotations."""
-    with open(file_path, "r+") as original_file:
-        with open(header_path, "r") as copyright_file:
+    with open(file_path, "r+", encoding="utf-8") as original_file:
+        with open(header_path, "r", encoding="utf-8") as copyright_file:
             original_content = original_file.read()
             original_file.seek(0)
             original_file.write(copyright_file.read() + "\n" + original_content)
@@ -211,6 +213,7 @@ def create_test_data(unicode_path):
         for line in emojis_list:
             test_file.write("%s\n" % line)
 
+
 class _EmojiData(object):
     """Holds the information about a single emoji."""
 
@@ -222,6 +225,7 @@ class _EmojiData(object):
         self.height = 0
         self.sdk_added = SDK_VERSION
         self.compat_added = METADATA_VERSION
+        self.supported = False
 
     def update_metrics(self, metrics):
         """Updates width/height instance variables with the values given in metrics dictionary.
@@ -268,7 +272,7 @@ def read_emoji_lines(file_path, optional=False):
     """
     result = []
     try:
-        with open(file_path) as file_stream:
+        with open(file_path, encoding="utf-8") as file_stream:
             for line in file_stream:
                 line = line.strip()
                 if line and not line.startswith('#'):
@@ -394,8 +398,8 @@ def load_previous_metadata(emoji_data_map):
        exist, or contains no emojis defined returns DEFAULT_EMOJI_ID"""
     current_emoji_id = DEFAULT_EMOJI_ID
     if os.path.isfile(INPUT_META_FILE):
-        with open(INPUT_META_FILE) as csvfile:
-            reader = csv.reader(csvfile, delimiter=' ')
+        with open(INPUT_META_FILE, encoding="utf-8") as csvfile:
+            reader = filter(lambda l: len(l), csv.reader(csvfile, delimiter=' '))
             for row in reader:
                 if row[0].startswith('#'):
                     continue
@@ -486,13 +490,16 @@ class EmojiFontCreator(object):
 
         self.font_path = font_path
         self.unicode_path = unicode_path
-        self.emoji_data_map = {}
-        self.remapped_codepoints = {}
+        # Map from space-separated codepoint sequences to data objects
+        self.emoji_data_map: Dict[str, _EmojiData] = {}
+        # Mapping from PUA-codepoint to glyph (name)
+        self.remapped_codepoints: Dict[int, str] = {}
+        # Map from glyph (name) to metrics. A glyph only has an entry if it's present in the CBDT table
         self.glyph_to_image_metrics_map = {}
         # set default emoji id to start of Supplemental Private Use Area-A
         self.emoji_id = DEFAULT_EMOJI_ID
 
-    def update_emoji_data(self, codepoints, glyph_name):
+    def update_emoji_data(self, codepoints: List[str], glyph_name: str):
         """Updates the existing EmojiData identified with codepoints. The fields that are set are:
         - emoji_id (if it does not exist)
         - image width/height"""
@@ -500,11 +507,17 @@ class EmojiFontCreator(object):
         if key in self.emoji_data_map:
             # add emoji to final data
             emoji_data = self.emoji_data_map[key]
-            emoji_data.update_metrics(self.glyph_to_image_metrics_map[glyph_name])
-            if emoji_data.emoji_id == 0:
-                emoji_data.emoji_id = self.emoji_id
-                self.emoji_id = self.emoji_id + 1
-            self.remapped_codepoints[emoji_data.emoji_id] = glyph_name
+            # Only update the metrics if we actually support the glyph as an emoji
+            if emoji_data.supported or glyph_name in self.glyph_to_image_metrics_map:
+                emoji_data.update_metrics(self.glyph_to_image_metrics_map[glyph_name])
+                emoji_data.supported = True
+                # We don't want emojis/glyphs/codepoints that are not support to be remapped
+                if emoji_data.emoji_id == 0:
+                    emoji_data.emoji_id = self.emoji_id
+                    self.emoji_id = self.emoji_id + 1
+                self.remapped_codepoints[emoji_data.emoji_id] = glyph_name
+            else:
+                emoji_data.supported = False
 
     def read_cbdt(self, ttf):
         """Read image size data from CBDT."""
@@ -513,6 +526,10 @@ class EmojiFontCreator(object):
             for key, data in strike_data.items():
                 data.decompile()
                 self.glyph_to_image_metrics_map[key] = data.metrics
+                if key in self.emoji_data_map:
+                    self.emoji_data_map[key].supported = True
+                else:
+                    logging.info("{} not in emoji_data_map".format(key))
 
     def read_cmap12(self, ttf, glyph_to_codepoint_map):
         """Reads single code point emojis that are in cmap12, updates glyph_to_codepoint_map and
@@ -608,7 +625,7 @@ class EmojiFontCreator(object):
             total_emoji_count = total_emoji_count + 1
 
         # write the new json file to be processed by FlatBuffers
-        with open(output_json_file_path, 'w') as json_file:
+        with open(output_json_file_path, 'w', encoding="utf-8") as json_file:
             print(json.dumps(output_json, indent=4, sort_keys=True, separators=(',', ':')),
                   file=json_file)
 
@@ -616,7 +633,7 @@ class EmojiFontCreator(object):
 
     def write_metadata_csv(self):
         """Writes emoji metadata into space separated file"""
-        with open(OUTPUT_META_FILE, 'w') as csvfile:
+        with open(OUTPUT_META_FILE, 'w', encoding="utf-8") as csvfile:
             csvwriter = csv.writer(csvfile, delimiter=' ')
             emoji_data_list = sorted(self.emoji_data_map.values(), key=lambda x: x.emoji_id)
             csvwriter.writerow(['#id', 'sdkAdded', 'compatAdded', 'codepoints'])
@@ -682,65 +699,71 @@ class EmojiFontCreator(object):
         # the modified field in the font causes the font ttf file to change, which makes it harder
         # to understand if something really changed in the font.
         with contextlib.closing(ttLib.TTFont(self.font_path, recalcTimestamp=False)) as ttf:
-            # read image size data
-            self.read_cbdt(ttf)
+            try:
+                # read image size data
+                self.read_cbdt(ttf)
 
-            # glyph name to codepoint map
-            glyph_to_codepoint_map = {}
+                # glyph name to codepoint map
+                glyph_to_codepoint_map = {}
 
-            # read single codepoint emojis under cmap12 and clear the table contents
-            cmap12_table = self.read_cmap12(ttf, glyph_to_codepoint_map)
+                # read single codepoint emojis under cmap12 and clear the table contents
+                cmap12_table = self.read_cmap12(ttf, glyph_to_codepoint_map)
 
-            # read emoji sequences gsub and clear the table contents
-            self.read_gsub(ttf, glyph_to_codepoint_map)
+                # read emoji sequences gsub and clear the table contents
+                self.read_gsub(ttf, glyph_to_codepoint_map)
 
-            # add all new codepoint to glyph mappings
-            cmap12_table.cmap.update(self.remapped_codepoints)
+                # add all new codepoint to glyph mappings
+                cmap12_table.cmap.update(self.remapped_codepoints)
 
-            # final metadata csv will be used to generate the sha, therefore write it before
-            # metadata json is written.
-            self.write_metadata_csv()
+                # final metadata csv will be used to generate the sha, therefore write it before
+                # metadata json is written.
+                self.write_metadata_csv()
 
-            output_json_file = os.path.join(tmp_dir, OUTPUT_JSON_FILE_NAME)
-            flatbuffer_bin_file = os.path.join(tmp_dir, FLATBUFFER_BIN)
-            flatbuffer_java_dir = os.path.join(tmp_dir, FLATBUFFER_JAVA_PATH)
+                output_json_file = os.path.join(tmp_dir, OUTPUT_JSON_FILE_NAME)
+                flatbuffer_bin_file = os.path.join(tmp_dir, FLATBUFFER_BIN)
+                flatbuffer_java_dir = os.path.join(tmp_dir, FLATBUFFER_JAVA_PATH)
 
-            total_emoji_count = self.write_metadata_json(output_json_file)
+                total_emoji_count = self.write_metadata_json(output_json_file)
 
-            # create the flatbuffers binary and java classes
-            flatc_command = ['flatc',
-                             '-o',
-                             tmp_dir,
-                             '-b',
-                             '-j',
-                             FLATBUFFER_SCHEMA,
-                             output_json_file]
-            subprocess.check_output(flatc_command)
+                # create the flatbuffers binary and java classes
+                # For Windows, assume there is a flatc.exe in this directory
+                # https://stackoverflow.com/a/8220141
+                flatc = './flatc.exe' if sys.platform == "win32" else 'flatc'
 
-            # inject metadata binary into font
-            inject_meta_into_font(ttf, flatbuffer_bin_file)
+                flatc_command = [flatc,
+                                 '-o',
+                                 tmp_dir,
+                                 '-b',
+                                 '-j',
+                                 FLATBUFFER_SCHEMA,
+                                 output_json_file]
+                subprocess.check_output(flatc_command)
 
-            # add wartermark glyph for manual verification.
-            self.add_watermark(ttf)
+                # inject metadata binary into font
+                inject_meta_into_font(ttf, flatbuffer_bin_file)
 
-            # update CBDT and CBLC versions since older android versions cannot read > 2.0
-            ttf['CBDT'].version = 2.0
-            ttf['CBLC'].version = 2.0
+                # add wartermark glyph for manual verification.
+                self.add_watermark(ttf)
 
-            # save the new font
-            ttf.save(FONT_PATH)
+                # update CBDT and CBLC versions since older android versions cannot read > 2.0
+                ttf['CBDT'].version = 2.0
+                ttf['CBLC'].version = 2.0
 
-            update_flatbuffer_java_files(flatbuffer_java_dir, #tmp dir
-                                         FLATBUFFER_HEADER,
-                                         FLATBUFFER_JAVA_TARGET)
+                # save the new font
+                ttf.save(FONT_PATH)
 
-            create_test_data(self.unicode_path)
+                update_flatbuffer_java_files(flatbuffer_java_dir, #tmp dir
+                                             FLATBUFFER_HEADER,
+                                             FLATBUFFER_JAVA_TARGET)
 
-            # clear the tmp output directory
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+                create_test_data(self.unicode_path)
 
-            print(
-                "{0} emojis are written to\n{1}".format(total_emoji_count, FONT_DIR))
+                print(
+                    "{0} emojis are written to\n{1}".format(total_emoji_count, FONT_DIR))
+
+            finally:
+                # clear the tmp output directory
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def print_usage():
